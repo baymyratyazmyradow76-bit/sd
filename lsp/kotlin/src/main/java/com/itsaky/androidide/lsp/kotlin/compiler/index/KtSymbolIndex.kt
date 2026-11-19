@@ -1,6 +1,5 @@
 package com.itsaky.androidide.lsp.kotlin.compiler.index
 
-import com.github.benmanes.caffeine.cache.Caffeine
 import com.itsaky.androidide.lsp.kotlin.compiler.CompilationKind
 import com.itsaky.androidide.lsp.kotlin.compiler.modules.KtModule
 import com.itsaky.androidide.lsp.kotlin.compiler.read
@@ -24,6 +23,8 @@ import org.jetbrains.kotlin.com.intellij.psi.PsiManager
 import org.jetbrains.kotlin.psi.KtFile
 import org.slf4j.LoggerFactory
 import java.nio.file.Path
+import java.util.Collections
+import java.util.LinkedHashMap
 import java.util.concurrent.ConcurrentHashMap
 
 val KT_SOURCE_FILE_INDEX_KEY = IndexKey<JvmSymbolIndex>("kt-source-file-index")
@@ -62,31 +63,32 @@ internal class KtSymbolIndex(
 		sourceIndex = sourceIndex,
 		scope = scope,
 	)
-
 	private val scanningWorker = ScanningWorker(
 		kind = kind,
 		sourceIndex = sourceIndex,
 		indexWorker = indexWorker,
 		modules = modules,
 	)
-
 	private var scanningJob: Job? = null
 	private var indexingJob: Job? = null
 
-	private val ktFileCache = Caffeine
-		.newBuilder()
-		.maximumSize(cacheSize)
-		.build<Path, KtFile>()
+	private val maxCacheEntries = cacheSize.coerceAtLeast(1L).toInt()
+	private val ktFileCache: MutableMap<Path, KtFile> =
+		Collections.synchronizedMap(
+			object : LinkedHashMap<Path, KtFile>(16, 0.75f, true) {
+				override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Path, KtFile>?): Boolean {
+					return size > maxCacheEntries
+				}
+			}
+		)
 
 	private val openedFiles = ConcurrentHashMap<Path, KtFile>()
-
-	val openedKtFiles: Sequence<Map.Entry<Path, KtFile>>
+	val openedKtFiles: Sequence>
 		get() = openedFiles.asSequence()
 
 	fun syncIndexInBackground() {
 		indexingJob?.cancel()
 		startIndexing()
-
 		scanningJob?.cancel()
 		startScanning()
 	}
@@ -101,7 +103,6 @@ internal class KtSymbolIndex(
 				}
 			}
 		}
-
 		indexingJob = job
 	}
 
@@ -120,7 +121,6 @@ internal class KtSymbolIndex(
 	fun refreshSources() {
 		Sentry.addBreadcrumb("KtSymbolIndex.refreshSources()")
 		indexingJob ?: startIndexing()
-
 		scanningJob?.cancel()
 		startScanning()
 	}
@@ -169,26 +169,21 @@ internal class KtSymbolIndex(
 
 	fun getKtFile(path: Path, virtualFile: VirtualFile? = null): KtFile? {
 		if (!DocumentUtils.isKotlinFile(path)) return null
-
 		openedFiles[path]?.also {
 			return it
 		}
-
-		ktFileCache.getIfPresent(path)?.also {
+		ktFileCache[path]?.also {
 			return it
 		}
-
 		var file = virtualFile
 		if (file == null) {
 			file = path.toVirtualFileOrNull()
 		}
-
 		if (file == null) {
 			return null
 		}
-
 		val ktFile = loadKtFile(file)
-		ktFileCache.put(path, ktFile)
+		ktFileCache[path] = ktFile
 		return ktFile
 	}
 
@@ -199,15 +194,8 @@ internal class KtSymbolIndex(
 
 	suspend fun close() {
 		indexWorker.submitCommand(IndexCommand.Stop)
-
 		scanningJob?.cancelAndJoin()
 		indexingJob?.join()
-
-		// Cancel AND JOIN the index's own scope. Beyond the main worker loop drained above, the
-		// debounced modifiedFileIndexer and queueOnFileChangedAsync coroutines also run
-		// project.read { PsiManager … }. Joining guarantees none survive into the caller's
-		// Disposer.dispose(...), which would otherwise crash with "Project is already disposed"
-		// (APPDEVFORALL-17R). This index owns `scope`.
 		scope.coroutineContext[Job]?.cancelAndJoin()
 	}
 }
