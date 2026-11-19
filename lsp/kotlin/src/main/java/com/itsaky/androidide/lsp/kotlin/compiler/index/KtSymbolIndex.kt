@@ -1,3 +1,4 @@
+
 package com.itsaky.androidide.lsp.kotlin.compiler.index
 
 import com.itsaky.androidide.lsp.kotlin.compiler.CompilationKind
@@ -27,188 +28,238 @@ import java.util.Collections
 import java.util.LinkedHashMap
 import java.util.concurrent.ConcurrentHashMap
 
-val KT_SOURCE_FILE_INDEX_KEY = IndexKey<JvmSymbolIndex>("kt-source-file-index")
-val KT_SOURCE_FILE_META_INDEX_KEY = IndexKey<KtFileMetadataIndex>("kt-source-file-meta-index")
+val KT_SOURCE_FILE_INDEX_KEY =
+    IndexKey<JvmSymbolIndex>("kt-source-file-index")
+
+val KT_SOURCE_FILE_META_INDEX_KEY =
+    IndexKey<KtFileMetadataIndex>("kt-source-file-meta-index")
 
 /**
  * An index of symbols from Kotlin source files and JARs.
  *
- * NOTE: This index does not own the provided [fileIndex], [sourceIndex] and [libraryIndex].
+ * NOTE: This index does not own the provided [fileIndex],
+ * [sourceIndex] and [libraryIndex].
  * Callers are responsible for closing the provided indexes.
  */
 internal class KtSymbolIndex(
-	val kind: CompilationKind,
-	val project: Project,
-	modules: List<KtModule>,
-	val fileIndex: KtFileMetadataIndex,
-	val sourceIndex: JvmSymbolIndex,
-	val libraryIndex: JvmSymbolIndex,
-	cacheSize: @NonNegative Long = DEFAULT_CACHE_SIZE,
-	private val scope: CoroutineScope = CoroutineScope(
-		Dispatchers.Default + SupervisorJob() + CoroutineName(
-			"KtSymbolIndex"
-		)
-	)
+    val kind: CompilationKind,
+    val project: Project,
+    modules: List<KtModule>,
+    val fileIndex: KtFileMetadataIndex,
+    val sourceIndex: JvmSymbolIndex,
+    val libraryIndex: JvmSymbolIndex,
+    cacheSize: @NonNegative Long = DEFAULT_CACHE_SIZE,
+    private val scope: CoroutineScope = CoroutineScope(
+        Dispatchers.Default +
+            SupervisorJob() +
+            CoroutineName("KtSymbolIndex")
+    )
 ) {
-	companion object {
-		private val logger = LoggerFactory.getLogger(KtSymbolIndex::class.java)
-		const val DEFAULT_CACHE_SIZE = 100L
-	}
 
-	private val workerQueue = WorkerQueue<IndexCommand>()
-	private val indexWorker = IndexWorker(
-		project = project,
-		queue = workerQueue,
-		fileIndex = fileIndex,
-		sourceIndex = sourceIndex,
-		scope = scope,
-	)
-	private val scanningWorker = ScanningWorker(
-		kind = kind,
-		sourceIndex = sourceIndex,
-		indexWorker = indexWorker,
-		modules = modules,
-	)
-	private var scanningJob: Job? = null
-	private var indexingJob: Job? = null
+    companion object {
+        private val logger =
+            LoggerFactory.getLogger(KtSymbolIndex::class.java)
 
-	private val maxCacheEntries = cacheSize.coerceAtLeast(1L).toInt()
-	private val ktFileCache: MutableMap<Path, KtFile> =
-		Collections.synchronizedMap(
-			object : LinkedHashMap<Path, KtFile>(16, 0.75f, true) {
-				override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Path, KtFile>?): Boolean {
-					return size > maxCacheEntries
-				}
-			}
-		)
+        const val DEFAULT_CACHE_SIZE = 100L
+    }
 
-	private val openedFiles = ConcurrentHashMap<Path, KtFile>()
-	val openedKtFiles: Sequence>
-		get() = openedFiles.asSequence()
+    private val workerQueue = WorkerQueue<IndexCommand>()
 
-	fun syncIndexInBackground() {
-		indexingJob?.cancel()
-		startIndexing()
-		scanningJob?.cancel()
-		startScanning()
-	}
+    private val indexWorker = IndexWorker(
+        project = project,
+        queue = workerQueue,
+        fileIndex = fileIndex,
+        sourceIndex = sourceIndex,
+        scope = scope
+    )
 
-	private fun startIndexing() {
-		val job = scope.launch {
-			try {
-				indexWorker.start()
-			} finally {
-				if (indexingJob === coroutineContext[Job]) {
-					indexingJob = null
-				}
-			}
-		}
-		indexingJob = job
-	}
+    private val scanningWorker = ScanningWorker(
+        kind = kind,
+        sourceIndex = sourceIndex,
+        indexWorker = indexWorker,
+        modules = modules
+    )
 
-	private fun startScanning() {
-		scanningJob = scope.launch {
-			try {
-				scanningWorker.scan()
-			} finally {
-				if (scanningJob === coroutineContext[Job]) {
-					scanningJob = null
-				}
-			}
-		}
-	}
+    private var scanningJob: Job? = null
+    private var indexingJob: Job? = null
 
-	fun refreshSources() {
-		Sentry.addBreadcrumb("KtSymbolIndex.refreshSources()")
-		indexingJob ?: startIndexing()
-		scanningJob?.cancel()
-		startScanning()
-	}
+    private val maxCacheEntries =
+        cacheSize.coerceAtLeast(1L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
-	private fun getVirtualFileOrWarn(path: Path): VirtualFile? {
-		return path.toVirtualFileOrNull() ?: run {
-			logger.warn("unable to find virtual file for path {}", path)
-			null
-		}
-	}
+    private val ktFileCache: MutableMap<Path, KtFile> =
+        Collections.synchronizedMap(
+            object : LinkedHashMap<Path, KtFile>(16, 0.75f, true) {
+                override fun removeEldestEntry(
+                    eldest: MutableMap.MutableEntry<Path, KtFile>?
+                ): Boolean {
+                    return size > maxCacheEntries
+                }
+            }
+        )
 
-	suspend fun submitForIndexing(path: Path) {
-		val vf = getVirtualFileOrWarn(path) ?: return
-		indexWorker.apply {
-			submitCommand(IndexCommand.ScanSourceFile(vf))
-			submitCommand(IndexCommand.IndexSourceFile(vf))
-		}
-	}
+    private val openedFiles = ConcurrentHashMap<Path, KtFile>()
 
-	suspend fun removeFromIndex(path: Path) {
-		indexWorker.submitCommand(IndexCommand.RemoveFromIndex(path))
-	}
+    val openedKtFiles: Sequence<KtFile>
+        get() = openedFiles.values.asSequence()
 
-	fun queueOnFileChangedAsync(ktFile: KtFile) {
-		scope.launch {
-			queueOnFileChanged(ktFile)
-		}
-	}
+    fun syncIndexInBackground() {
+        indexingJob?.cancel()
+        startIndexing()
 
-	suspend fun queueOnFileChanged(ktFile: KtFile) {
-		indexWorker.submitCommand(IndexCommand.IndexModifiedFile(ktFile))
-	}
+        scanningJob?.cancel()
+        startScanning()
+    }
 
-	fun openKtFile(path: Path, ktFile: KtFile): KtFile? {
-		return openedFiles.put(path, ktFile)
-	}
+    private fun startIndexing() {
+        val job = scope.launch {
+            try {
+                indexWorker.start()
+            } finally {
+                if (indexingJob === coroutineContext[Job]) {
+                    indexingJob = null
+                }
+            }
+        }
 
-	fun closeKtFile(path: Path) {
-		openedFiles.remove(path)
-	}
+        indexingJob = job
+    }
 
-	fun getOpenedKtFile(path: Path) = openedFiles[path]
+    private fun startScanning() {
+        val job = scope.launch {
+            try {
+                scanningWorker.scan()
+            } finally {
+                if (scanningJob === coroutineContext[Job]) {
+                    scanningJob = null
+                }
+            }
+        }
 
-	fun getKtFile(vf: VirtualFile): KtFile? =
-		getKtFile(vf.toNioPath(), vf)
+        scanningJob = job
+    }
 
-	fun getKtFile(path: Path, virtualFile: VirtualFile? = null): KtFile? {
-		if (!DocumentUtils.isKotlinFile(path)) return null
-		openedFiles[path]?.also {
-			return it
-		}
-		ktFileCache[path]?.also {
-			return it
-		}
-		var file = virtualFile
-		if (file == null) {
-			file = path.toVirtualFileOrNull()
-		}
-		if (file == null) {
-			return null
-		}
-		val ktFile = loadKtFile(file)
-		ktFileCache[path] = ktFile
-		return ktFile
-	}
+    fun refreshSources() {
+        Sentry.addBreadcrumb("KtSymbolIndex.refreshSources()")
 
-	private fun loadKtFile(vf: VirtualFile): KtFile = project.read {
-		PsiManager.getInstance(project)
-			.findFile(vf) as KtFile
-	}
+        indexingJob ?: startIndexing()
 
-	suspend fun close() {
-		indexWorker.submitCommand(IndexCommand.Stop)
-		scanningJob?.cancelAndJoin()
-		indexingJob?.join()
-		scope.coroutineContext[Job]?.cancelAndJoin()
-	}
+        scanningJob?.cancel()
+        startScanning()
+    }
+
+    private fun getVirtualFileOrWarn(path: Path): VirtualFile? {
+        return path.toVirtualFileOrNull() ?: run {
+            logger.warn(
+                "unable to find virtual file for path {}",
+                path
+            )
+            null
+        }
+    }
+
+    suspend fun submitForIndexing(path: Path) {
+        val vf = getVirtualFileOrWarn(path) ?: return
+
+        indexWorker.apply {
+            submitCommand(IndexCommand.ScanSourceFile(vf))
+            submitCommand(IndexCommand.IndexSourceFile(vf))
+        }
+    }
+
+    suspend fun removeFromIndex(path: Path) {
+        indexWorker.submitCommand(
+            IndexCommand.RemoveFromIndex(path)
+        )
+    }
+
+    fun queueOnFileChangedAsync(ktFile: KtFile) {
+        scope.launch {
+            queueOnFileChanged(ktFile)
+        }
+    }
+
+    suspend fun queueOnFileChanged(ktFile: KtFile) {
+        indexWorker.submitCommand(
+            IndexCommand.IndexModifiedFile(ktFile)
+        )
+    }
+
+    fun openKtFile(path: Path, ktFile: KtFile): KtFile? {
+        return openedFiles.put(path, ktFile)
+    }
+
+    fun closeKtFile(path: Path) {
+        openedFiles.remove(path)
+    }
+
+    fun getOpenedKtFile(path: Path): KtFile? {
+        return openedFiles[path]
+    }
+
+    fun getKtFile(vf: VirtualFile): KtFile? {
+        return getKtFile(vf.toNioPath(), vf)
+    }
+
+    fun getKtFile(
+        path: Path,
+        virtualFile: VirtualFile? = null
+    ): KtFile? {
+
+        if (!DocumentUtils.isKotlinFile(path)) {
+            return null
+        }
+
+        openedFiles[path]?.let {
+            return it
+        }
+
+        ktFileCache[path]?.let {
+            return it
+        }
+
+        val file = virtualFile ?: path.toVirtualFileOrNull()
+            ?: return null
+
+        val ktFile = loadKtFile(file) ?: return null
+
+        ktFileCache[path] = ktFile
+
+        return ktFile
+    }
+
+    private fun loadKtFile(vf: VirtualFile): KtFile? {
+        return project.read {
+            PsiManager.getInstance(project)
+                .findFile(vf) as? KtFile
+        }
+    }
+
+    suspend fun close() {
+        indexWorker.submitCommand(IndexCommand.Stop)
+
+        scanningJob?.cancelAndJoin()
+        indexingJob?.cancelAndJoin()
+
+        scope.coroutineContext[Job]?.cancelAndJoin()
+    }
 }
 
-internal fun KtSymbolIndex.packageExistsInSource(packageFqn: String) =
-	fileIndex.packageExists(packageFqn)
+internal fun KtSymbolIndex.packageExistsInSource(
+    packageFqn: String
+) = fileIndex.packageExists(packageFqn)
 
-internal fun KtSymbolIndex.filesForPackage(packageFqn: String) =
-	fileIndex.getFilesForPackage(packageFqn)
+internal fun KtSymbolIndex.filesForPackage(
+    packageFqn: String
+) = fileIndex.getFilesForPackage(packageFqn)
 
-internal fun KtSymbolIndex.subpackageNames(packageFqn: String) =
-	fileIndex.getSubpackageNames(packageFqn)
+internal fun KtSymbolIndex.subpackageNames(
+    packageFqn: String
+) = fileIndex.getSubpackageNames(packageFqn)
 
-internal fun KtSymbolIndex.findSymbolBySimpleName(name: String, limit: Int) =
-	(sourceIndex.findBySimpleName(name, 0) + libraryIndex.findBySimpleName(name, 0))
-		.take(limit)
+internal fun KtSymbolIndex.findSymbolBySimpleName(
+    name: String,
+    limit: Int
+) = (
+    sourceIndex.findBySimpleName(name, 0) +
+        libraryIndex.findBySimpleName(name, 0)
+    ).take(limit)
